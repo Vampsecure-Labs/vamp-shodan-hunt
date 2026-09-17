@@ -50,16 +50,16 @@ from rich.rule import Rule
 
 console = Console()
 
-VERSION   = "1.0"
+VERSION   = "1.1"
 TOOL_NAME = "vamp-shodan-hunt"
 
 BANNER = r"""
-__   ___   __  __ ___  ___ ___ ___ _   _ ___ ___ _      _   ___ ___ 
+__   ___   __  __ ___  ___ ___ ___ _   _ ___ ___ _      _   ___ ___
 \ \ / /_\ |  \/  | _ \/ __| __/ __| | | | _ \ __| |    /_\ | _ ) __|
  \ V / _ \| |\/| |  _/\__ \ _| (__| |_| |   / _|| |__ / _ \| _ \__ \
   \_/_/ \_\_|  |_|_|  |___/___\___|\___/|_|_\___|____/_/ \_\___/___/
   by Antonio Hernandez "Belky" — VampSecure Studios
-  vamp-shodan-hunt v1.0 · OSINT Exposure Intelligence
+  vamp-shodan-hunt v1.1 · OSINT Exposure Intelligence
   ────────────────────────────────────────────────────────────────────────
   USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal
 """
@@ -114,6 +114,7 @@ class ShodanMatch:
     version: str
     banner:  str
     vulns:   List[str] = field(default_factory=list)
+    cpe:     str = ""      # CPE 2.3 del servicio (si Shodan lo proporciona)
 
 
 @dataclass
@@ -210,6 +211,11 @@ class ShodanHunter:
             for m in raw:
                 if len(matches) >= self._limit:
                     break
+                # Extraer CPE: Shodan puede devolver 'cpe' (lista) o 'cpe23' (lista)
+                cpe_raw  = m.get("cpe23") or m.get("cpe") or []
+                cpe_str  = cpe_raw[0] if isinstance(cpe_raw, list) and cpe_raw else (
+                    cpe_raw if isinstance(cpe_raw, str) else ""
+                )
                 matches.append(ShodanMatch(
                     ip      = m.get("ip_str", ""),
                     port    = m.get("port", 0),
@@ -219,6 +225,7 @@ class ShodanHunter:
                     version = m.get("version", ""),
                     banner  = (m.get("data", "") or "")[:140].replace("\n", " ").strip(),
                     vulns   = list((m.get("vulns") or {}).keys()),
+                    cpe     = cpe_str,
                 ))
             if len(raw) < 100:
                 break
@@ -552,6 +559,40 @@ def to_json(results: List[HuntResult], mode: str, generated_at: str) -> str:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Exportación en formato oracle (entrada para vamp-cve-oracle)
+# ────────────────────────────────────────────────────────────────────────────
+
+def to_oracle_json(results: List[HuntResult]) -> str:
+    """
+    Transforma los hallazgos de Shodan al formato de entrada de vamp-cve-oracle.
+
+    Genera una lista JSON de objetos con claves host, product, version y cpe,
+    deduplicados por (host, port). Los campos vacíos se incluyen como cadena
+    vacía para mantener el esquema uniforme que espera vamp-cve-oracle.
+    """
+    oracle: List[Dict] = []
+    seen: set = set()
+
+    for result in results:
+        for match in result.matches:
+            if not match.ip:
+                continue
+            key = (match.ip, match.port)
+            if key in seen:
+                continue
+            seen.add(key)
+            oracle.append({
+                "host":    match.ip,
+                "port":    match.port,
+                "product": match.product or "",
+                "version": match.version or "",
+                "cpe":     match.cpe or "",
+            })
+
+    return json.dumps(oracle, indent=2, ensure_ascii=False)
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Punto de entrada CLI
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -613,6 +654,17 @@ def main() -> None:
     p.add_argument(
         "-o", "--output", metavar="FILE",
         help="Guardar resultados en formato JSON",
+    )
+    p.add_argument(
+        "--export-oracle", metavar="FILE",
+        help="Exportar hallazgos Shodan en formato de entrada para vamp-cve-oracle "
+             "(lista JSON con host, product, version, cpe)",
+    )
+    p.add_argument(
+        "--pipe-oracle", metavar="CMD",
+        help="Ejecutar vamp-cve-oracle automáticamente con el JSON generado por "
+             "--export-oracle (la herramienta debe estar en PATH). "
+             "Ejemplo: --pipe-oracle 'vamp-cve-oracle --input'",
     )
 
     from vampsec_report import add_report_args
@@ -709,6 +761,40 @@ def main() -> None:
             to_json(results, mode, generated_at), encoding="utf-8"
         )
         console.print(f"\n[green]✔ JSON guardado en {args.output}[/]")
+
+    # ── Export oracle (formato de entrada para vamp-cve-oracle) ─────────────
+    export_oracle_path: Optional[str] = getattr(args, "export_oracle", None)
+    if export_oracle_path:
+        oracle_json = to_oracle_json(results)
+        Path(export_oracle_path).write_text(oracle_json, encoding="utf-8")
+        n_oracle = len(json.loads(oracle_json))
+        console.print(
+            f"[green]✔ Oracle export:[/] {export_oracle_path} ({n_oracle} entradas)"
+        )
+
+        # ── Pipeline automático a vamp-cve-oracle ────────────────────────────
+        pipe_cmd: Optional[str] = getattr(args, "pipe_oracle", None)
+        if pipe_cmd:
+            import subprocess
+            cmd_full = f"{pipe_cmd} {export_oracle_path}"
+            console.print(f"[cyan]→ Ejecutando:[/] {cmd_full}")
+            try:
+                proc = subprocess.run(
+                    cmd_full,
+                    shell=True,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    console.print(
+                        f"[yellow]⚠ vamp-cve-oracle terminó con código {proc.returncode}[/]"
+                    )
+            except FileNotFoundError:
+                console.print(
+                    "[red]✗ Comando no encontrado. Asegúrate de que vamp-cve-oracle "
+                    "está instalado y en PATH.[/]"
+                )
+            except Exception as exc:
+                console.print(f"[red]✗ Error al ejecutar pipeline: {exc}[/]")
 
     if args.report_html or args.report_pdf:
         from vampsec_report import VampSecReport, meta_from_args

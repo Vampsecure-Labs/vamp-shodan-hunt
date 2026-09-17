@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vamp-shodan-hunt"
-version = "1.0"
+version = "1.1"
 description = "Shodan OSINT hunter for attack-surface mapping in authorized audits"
 readme = "README.md"
 license = { text = "MIT" }
