@@ -43,6 +43,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
+# Importar tomllib (Python 3.11+) o tomli como alternativa para Python 3.9/3.10
+try:
+    import tomllib  # type: ignore[import]
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore[import]
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
+
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -50,7 +59,7 @@ from rich.rule import Rule
 
 console = Console()
 
-VERSION   = "1.1"
+VERSION   = "1.2"
 TOOL_NAME = "vamp-shodan-hunt"
 
 BANNER = r"""
@@ -59,7 +68,7 @@ __   ___   __  __ ___  ___ ___ ___ _   _ ___ ___ _      _   ___ ___
  \ V / _ \| |\/| |  _/\__ \ _| (__| |_| |   / _|| |__ / _ \| _ \__ \
   \_/_/ \_\_|  |_|_|  |___/___\___|\___/|_|_\___|____/_/ \_\___/___/
   by Antonio Hernandez "Belky" — VampSecure Studios
-  vamp-shodan-hunt v1.1 · OSINT Exposure Intelligence
+  vamp-shodan-hunt v1.2 · OSINT Exposure Intelligence (Shodan·Censys·BinaryEdge)
   ────────────────────────────────────────────────────────────────────────
   USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal
 """
@@ -68,6 +77,15 @@ __   ___   __  __ ___  ___ ___ ___ _   _ ___ ___ _      _   ___ ___
 SHODAN_API_INFO = "https://api.shodan.io/api-info"
 SHODAN_COUNT    = "https://api.shodan.io/shodan/host/count"
 SHODAN_SEARCH   = "https://api.shodan.io/shodan/host/search"
+
+# Endpoints Censys — búsqueda de hosts con autenticación Basic (id:secret)
+CENSYS_HOSTS_SEARCH = "https://search.censys.io/api/v2/hosts/search"
+
+# Endpoints BinaryEdge — inteligencia por IP
+BINARYEDGE_IP = "https://api.binaryedge.io/v2/query/ip"
+
+# Ruta al fichero de configuración compartido de VampSecure Labs
+_CONFIG_PATH = Path.home() / ".config" / "vampsec" / "config.toml"
 
 SEV_STYLE = {
     "CRITICAL": "bold red",
@@ -84,6 +102,67 @@ SEV_COLOR = {
     "LOW":      "#06b6d4",
     "INFO":     "#6b7280",
 }
+
+
+def cargar_config_api(
+    args_shodan_key: Optional[str] = None,
+    args_censys_id: Optional[str] = None,
+    args_censys_secret: Optional[str] = None,
+    args_binaryedge_key: Optional[str] = None,
+) -> dict:
+    """
+    Carga las claves de APIs de inteligencia con el siguiente orden de prioridad:
+
+    1. Flags CLI — máxima prioridad
+    2. Variables de entorno: SHODAN_API_KEY, VAMPSEC_CENSYS_API_ID,
+       VAMPSEC_CENSYS_API_SECRET, VAMPSEC_BINARYEDGE_KEY
+    3. Fichero ~/.config/vampsec/config.toml sección [shodan-hunt]
+    4. None → la fuente se salta silenciosamente
+
+    Devuelve un dict con claves 'shodan_key', 'censys_id', 'censys_secret',
+    'binaryedge_key'.
+    """
+    config: dict = {
+        "shodan_key":     None,
+        "censys_id":      None,
+        "censys_secret":  None,
+        "binaryedge_key": None,
+    }
+
+    # Paso 3: leer fichero de configuración (menor prioridad base)
+    if tomllib is not None and _CONFIG_PATH.exists():
+        try:
+            with _CONFIG_PATH.open("rb") as fh:
+                toml_data = tomllib.load(fh)
+            sec = toml_data.get("shodan-hunt", {})
+            config["shodan_key"]     = sec.get("shodan_api_key") or None
+            config["censys_id"]      = sec.get("censys_api_id") or None
+            config["censys_secret"]  = sec.get("censys_api_secret") or None
+            config["binaryedge_key"] = sec.get("binaryedge_api_key") or None
+        except Exception:
+            pass  # Config inválida → continuar sin ella
+
+    # Paso 2: variables de entorno (sobreescriben config file)
+    if os.environ.get("SHODAN_API_KEY"):
+        config["shodan_key"]     = os.environ["SHODAN_API_KEY"]
+    if os.environ.get("VAMPSEC_CENSYS_API_ID"):
+        config["censys_id"]      = os.environ["VAMPSEC_CENSYS_API_ID"]
+    if os.environ.get("VAMPSEC_CENSYS_API_SECRET"):
+        config["censys_secret"]  = os.environ["VAMPSEC_CENSYS_API_SECRET"]
+    if os.environ.get("VAMPSEC_BINARYEDGE_KEY"):
+        config["binaryedge_key"] = os.environ["VAMPSEC_BINARYEDGE_KEY"]
+
+    # Paso 1: flags CLI (máxima prioridad)
+    if args_shodan_key:
+        config["shodan_key"]     = args_shodan_key
+    if args_censys_id:
+        config["censys_id"]      = args_censys_id
+    if args_censys_secret:
+        config["censys_secret"]  = args_censys_secret
+    if args_binaryedge_key:
+        config["binaryedge_key"] = args_binaryedge_key
+
+    return config
 
 
 def _exposure_severity(count: int) -> str:
@@ -300,6 +379,258 @@ class ShodanHunter:
             except Exception as e:
                 console.print(f"[yellow]⚠ No se pudo verificar la cuenta Shodan: {e}[/]")
 
+            tasks = [self.hunt_one(mode, t, session) for t in targets]
+            return list(await asyncio.gather(*tasks))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Motor Censys (v2 API — autenticación Basic id:secret)
+# ────────────────────────────────────────────────────────────────────────────
+
+class CensysHunter:
+    """
+    Consulta la API v2 de Censys para búsqueda de hosts.
+    El plan gratuito permite un número limitado de búsquedas por mes.
+    Requiere API ID + API Secret (ambos de censys.io/register).
+    """
+
+    def __init__(self, api_id: str, api_secret: str, limit: int = 100) -> None:
+        self._id     = api_id
+        self._secret = api_secret
+        self._limit  = limit
+
+    def _build_query(self, mode: str, target: str) -> str:
+        """Traduce el modo/target a sintaxis de consulta Censys v2."""
+        if mode == "cve":
+            # Censys indexa CVEs en el campo 'labels' o como parte de servicios
+            return f'services.vulnerability_cves: "{target}"'
+        elif mode == "product":
+            return f'services.software.product: "{target}"'
+        elif mode == "org":
+            return f'autonomous_system.name: "{target}"'
+        else:
+            return target
+
+    def _map_match(self, hit: dict) -> ShodanMatch:
+        """Mapea un resultado Censys v2 a la estructura interna ShodanMatch."""
+        ip = hit.get("ip", "")
+        # Servicios: lista de objetos con puerto y descripción
+        servicios = hit.get("services", [])
+        puerto = 0
+        producto = ""
+        version  = ""
+        banner   = ""
+        if servicios:
+            svc = servicios[0]
+            puerto   = svc.get("port", 0)
+            software = svc.get("software", [])
+            if software and isinstance(software, list):
+                sw = software[0]
+                producto = sw.get("product", "")
+                version  = sw.get("version", "")
+            banner = (svc.get("banner", "") or "")[:140].replace("\n", " ").strip()
+
+        # Datos de localización y organización
+        location = hit.get("location", {})
+        pais = location.get("country", "")
+        asn  = hit.get("autonomous_system", {})
+        org  = asn.get("name", "")
+
+        return ShodanMatch(
+            ip=ip, port=puerto, org=org, country=pais,
+            product=producto, version=version, banner=banner,
+        )
+
+    async def hunt_one(
+        self,
+        mode: str,
+        target: str,
+        session: aiohttp.ClientSession,
+    ) -> HuntResult:
+        """Ejecuta la búsqueda en Censys para un objetivo individual."""
+        import base64
+        query  = self._build_query(mode, target)
+        result = HuntResult(mode=mode, query=query, label=target, total=0)
+        result.label = f"[Censys] {target}"
+
+        # Autenticación Basic con id:secret
+        credencial = base64.b64encode(f"{self._id}:{self._secret}".encode()).decode()
+        headers    = {"Authorization": f"Basic {credencial}"}
+
+        cursor  = None
+        matches: List[ShodanMatch] = []
+
+        try:
+            while len(matches) < self._limit:
+                params: dict = {"q": query, "per_page": min(100, self._limit - len(matches))}
+                if cursor:
+                    params["cursor"] = cursor
+
+                async with session.get(
+                    CENSYS_HOSTS_SEARCH,
+                    headers=headers,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=25),
+                ) as resp:
+                    if resp.status == 401:
+                        result.error = "Censys: credenciales inválidas (id o secret incorrecto)"
+                        return result
+                    if resp.status == 403:
+                        result.error = "Censys: sin permisos o cuota agotada"
+                        return result
+                    if resp.status != 200:
+                        result.error = f"Censys: HTTP {resp.status}"
+                        return result
+                    data = await resp.json(content_type=None)
+
+                resultado = data.get("result", {})
+                hits      = resultado.get("hits", [])
+                total     = resultado.get("total", 0)
+                result.total = total
+
+                for hit in hits:
+                    if len(matches) >= self._limit:
+                        break
+                    matches.append(self._map_match(hit))
+
+                # Paginación via cursor
+                links  = resultado.get("links", {})
+                cursor = links.get("next")
+                if not cursor or not hits:
+                    break
+
+        except Exception as exc:
+            result.error = str(exc)[:200]
+            return result
+
+        result.matches = matches
+        top_c, top_o, top_p, top_v = (
+            Counter(m.country for m in matches if m.country).most_common(8),
+            Counter(m.org     for m in matches if m.org).most_common(8),
+            Counter(m.product for m in matches if m.product).most_common(8),
+            Counter(m.version for m in matches if m.version and m.version.strip()).most_common(8),
+        )
+        result.top_countries = top_c
+        result.top_orgs      = top_o
+        result.top_products  = top_p
+        result.top_versions  = top_v
+        return result
+
+    async def run(self, mode: str, targets: List[str]) -> List[HuntResult]:
+        """Ejecuta las consultas Censys en paralelo para todos los targets."""
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": f"VampSecureLabs-ShodanHunt/{VERSION}"}
+        ) as session:
+            tasks = [self.hunt_one(mode, t, session) for t in targets]
+            return list(await asyncio.gather(*tasks))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Motor BinaryEdge (v2 API — autenticación con header X-Key)
+# ────────────────────────────────────────────────────────────────────────────
+
+class BinaryEdgeHunter:
+    """
+    Consulta la API v2 de BinaryEdge para inteligencia por IP.
+    Solo admite consultas por IP (no por CVE/producto/org directamente).
+    Requiere API key de pago en binaryedge.io.
+    """
+
+    def __init__(self, api_key: str, limit: int = 100) -> None:
+        self._key   = api_key
+        self._limit = limit
+
+    def _map_match(self, ip: str, evento: dict) -> ShodanMatch:
+        """Mapea un evento BinaryEdge a la estructura interna ShodanMatch."""
+        resultado = evento.get("result", {})
+        datos     = resultado.get("data", {})
+
+        puerto   = datos.get("port", 0)
+        producto = datos.get("product", "") or datos.get("service", {}).get("name", "")
+        version  = datos.get("version", "") or datos.get("service", {}).get("version", "")
+        banner   = (
+            str(datos.get("banner", "") or datos.get("service", {}).get("banner", "") or "")
+        )[:140].replace("\n", " ").strip()
+
+        return ShodanMatch(
+            ip=ip, port=puerto, org="", country="",
+            product=producto, version=version, banner=banner,
+        )
+
+    async def hunt_one(
+        self,
+        mode: str,
+        target: str,
+        session: aiohttp.ClientSession,
+    ) -> HuntResult:
+        """
+        Consulta BinaryEdge para un target.
+        Solo funciona en modo 'query' con una IP directa.
+        Para modos cve/product/org devuelve un resultado vacío con nota informativa.
+        """
+        result = HuntResult(mode=mode, query=target, label=target, total=0)
+        result.label = f"[BinaryEdge] {target}"
+
+        # BinaryEdge v2 solo admite consultas directas por IP en el endpoint básico
+        if mode not in ("query",):
+            # Para CVE/product/org se requiere el endpoint de búsqueda completo
+            # (disponible solo en planes enterprise)
+            result.error = (
+                "BinaryEdge: modo directo solo disponible para IPs con --query. "
+                "Usa el plan enterprise para búsquedas por CVE/producto/org."
+            )
+            return result
+
+        # Validar que el target parece una IP
+        import re as _re
+        if not _re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target.strip()):
+            result.error = "BinaryEdge: el target debe ser una IP (ej. 192.0.2.1)"
+            return result
+
+        url     = f"{BINARYEDGE_IP}/{target.strip()}"
+        headers = {"X-Key": self._key}
+
+        try:
+            async with session.get(
+                url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status == 401:
+                    result.error = "BinaryEdge: API key inválida"
+                    return result
+                if resp.status == 404:
+                    result.total = 0
+                    return result
+                if resp.status != 200:
+                    result.error = f"BinaryEdge: HTTP {resp.status}"
+                    return result
+                data = await resp.json(content_type=None)
+        except Exception as exc:
+            result.error = str(exc)[:200]
+            return result
+
+        eventos = data.get("events", [])
+        result.total   = len(eventos)
+        matches: List[ShodanMatch] = []
+
+        for ev in eventos[: self._limit]:
+            matches.append(self._map_match(target.strip(), ev))
+
+        result.matches = matches
+        top_p, top_v   = (
+            Counter(m.product for m in matches if m.product).most_common(8),
+            Counter(m.version for m in matches if m.version and m.version.strip()).most_common(8),
+        )
+        result.top_products = top_p
+        result.top_versions = top_v
+        return result
+
+    async def run(self, mode: str, targets: List[str]) -> List[HuntResult]:
+        """Ejecuta las consultas BinaryEdge en paralelo para todos los targets."""
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": f"VampSecureLabs-ShodanHunt/{VERSION}"}
+        ) as session:
             tasks = [self.hunt_one(mode, t, session) for t in targets]
             return list(await asyncio.gather(*tasks))
 
@@ -638,10 +969,31 @@ def main() -> None:
         help="Consulta Shodan arbitraria pass-through (ej. 'port:8443 ssl:\"Fortinet\"')",
     )
 
-    # Opciones generales
+    # Opciones generales — claves de fuentes de inteligencia
     p.add_argument(
         "--key", metavar="API_KEY",
-        help="Clave API de Shodan (alternativa: variable SHODAN_API_KEY)",
+        help="Clave API de Shodan (alternativa: SHODAN_API_KEY o ~/.config/vampsec/config.toml)",
+    )
+    p.add_argument(
+        "--censys-id", metavar="API_ID",
+        help="API ID de Censys (alternativa: VAMPSEC_CENSYS_API_ID o config.toml). "
+             "Registro gratuito en censys.io/register",
+    )
+    p.add_argument(
+        "--censys-secret", metavar="API_SECRET",
+        help="API Secret de Censys (debe usarse junto con --censys-id)",
+    )
+    p.add_argument(
+        "--binaryedge-key", metavar="API_KEY",
+        help="API key de BinaryEdge (alternativa: VAMPSEC_BINARYEDGE_KEY o config.toml). "
+             "Solo funciona con --query <IP> en el plan básico",
+    )
+    p.add_argument(
+        "--source", metavar="FUENTE",
+        choices=["shodan", "censys", "binaryedge", "all"],
+        default="all",
+        help="Fuentes de inteligencia a usar: shodan | censys | binaryedge | all "
+             "(default: all — usa todas las que tengan key configurada)",
     )
     p.add_argument(
         "--limit", type=int, default=100, metavar="N",
@@ -672,11 +1024,42 @@ def main() -> None:
 
     args = p.parse_args()
 
-    # Resolver clave API
-    shodan_key = args.key or os.environ.get("SHODAN_API_KEY", "")
-    if not shodan_key:
+    # Resolver claves de todas las fuentes de inteligencia
+    config_api = cargar_config_api(
+        args_shodan_key     = getattr(args, "key", None),
+        args_censys_id      = getattr(args, "censys_id", None),
+        args_censys_secret  = getattr(args, "censys_secret", None),
+        args_binaryedge_key = getattr(args, "binaryedge_key", None),
+    )
+    shodan_key     = config_api["shodan_key"] or ""
+    censys_id      = config_api["censys_id"]
+    censys_secret  = config_api["censys_secret"]
+    binaryedge_key = config_api["binaryedge_key"]
+
+    # Fuente seleccionada (--source)
+    fuente = getattr(args, "source", "all")
+
+    # Determinar qué fuentes se van a usar
+    usar_shodan     = fuente in ("shodan", "all") and bool(shodan_key)
+    usar_censys     = fuente in ("censys", "all") and bool(censys_id) and bool(censys_secret)
+    usar_binaryedge = fuente in ("binaryedge", "all") and bool(binaryedge_key)
+
+    if not usar_shodan and not usar_censys and not usar_binaryedge:
+        # Si se forzó una fuente específica y no tiene key, avisar con error
+        if fuente != "all":
+            console.print(
+                f"[red]✗ Fuente '{fuente}' seleccionada pero sin credenciales configuradas.[/]"
+            )
+            console.print(
+                "[dim]Usa --key / --censys-id --censys-secret / --binaryedge-key "
+                "o ~/.config/vampsec/config.toml[/]"
+            )
+            sys.exit(1)
+        # Modo 'all' sin ninguna clave → mantener compatibilidad, requerir Shodan
         console.print(
-            "[red]✗ Clave API de Shodan requerida: usa --key o exporta SHODAN_API_KEY[/]"
+            "[red]✗ Ninguna fuente configurada. "
+            "Especifica al menos una clave (--key, --censys-id/--censys-secret, "
+            "--binaryedge-key o ~/.config/vampsec/config.toml)[/]"
         )
         sys.exit(1)
 
@@ -694,13 +1077,30 @@ def main() -> None:
         mode    = "query"
         targets = [args.query]
 
+    # Mostrar resumen de fuentes activas
+    fuentes_activas = []
+    if usar_shodan:
+        fuentes_activas.append("Shodan")
+    if usar_censys:
+        fuentes_activas.append("Censys")
+    if usar_binaryedge:
+        fuentes_activas.append("BinaryEdge")
+
     console.print(
         f"\n[cyan]Modo: [bold]{mode}[/] · Targets: [bold]{len(targets)}[/] · "
-        f"Límite: [bold]{args.limit}[/] hosts/consulta[/]\n"
+        f"Límite: [bold]{args.limit}[/] hosts/consulta · "
+        f"Fuentes: [bold]{', '.join(fuentes_activas)}[/][/]\n"
     )
 
     if args.count_only:
-        # Modo rápido: solo conteos, sin traer resultados
+        # Modo rápido: solo conteos Shodan (sin traer resultados completos)
+        if not usar_shodan:
+            console.print(
+                "[yellow]⚠ --count-only solo disponible con Shodan. "
+                "Configura --key o SHODAN_API_KEY.[/]"
+            )
+            sys.exit(1)
+
         async def _count_only():
             async with aiohttp.ClientSession(
                 headers={"User-Agent": f"VampSecureLabs-ShodanHunt/{VERSION}"}
@@ -743,9 +1143,23 @@ def main() -> None:
         asyncio.run(_count_only())
         return
 
-    # Ejecución completa
-    hunter  = ShodanHunter(shodan_key, limit=args.limit)
-    results = asyncio.run(hunter.run(mode, targets))
+    # Ejecución completa — consultar todas las fuentes con key disponible
+    results: List[HuntResult] = []
+
+    if usar_shodan:
+        hunter_shodan = ShodanHunter(shodan_key, limit=args.limit)
+        resultados_shodan = asyncio.run(hunter_shodan.run(mode, targets))
+        results.extend(resultados_shodan)
+
+    if usar_censys:
+        hunter_censys = CensysHunter(censys_id, censys_secret, limit=args.limit)
+        resultados_censys = asyncio.run(hunter_censys.run(mode, targets))
+        results.extend(resultados_censys)
+
+    if usar_binaryedge:
+        hunter_be = BinaryEdgeHunter(binaryedge_key, limit=args.limit)
+        resultados_be = asyncio.run(hunter_be.run(mode, targets))
+        results.extend(resultados_be)
 
     console.print()
     print_summary_table(results)
@@ -809,6 +1223,28 @@ def main() -> None:
                 console.print(f"[green]✔ Informe cliente PDF: {args.report_pdf}[/]")
             except RuntimeError as e:
                 console.print(f"[yellow]⚠ PDF no generado: {e}[/]")
+
+    # Mensaje informativo si hay fuentes de inteligencia no configuradas
+    fuentes_faltantes = []
+    if not usar_censys:
+        fuentes_faltantes.append(
+            "  → Censys (plan gratuito): censys.io/register "
+            "→ --censys-id/--censys-secret o ~/.config/vampsec/config.toml"
+        )
+    if not usar_binaryedge:
+        fuentes_faltantes.append(
+            "  → BinaryEdge (de pago): binaryedge.io "
+            "→ --binaryedge-key o ~/.config/vampsec/config.toml"
+        )
+    if not usar_shodan:
+        fuentes_faltantes.append(
+            "  → Shodan (freemium): shodan.io "
+            "→ --key o ~/.config/vampsec/config.toml"
+        )
+    if fuentes_faltantes:
+        console.print("\n[dim][INFO] Fuentes de inteligencia no configuradas:[/]")
+        for msg in fuentes_faltantes:
+            console.print(f"[dim]{msg}[/]")
 
     # Código de salida según severidad máxima
     max_total = max((r.total for r in results if not r.error), default=0)

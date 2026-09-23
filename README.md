@@ -1,3 +1,4 @@
+<!-- © VampSecure Studios — VampSecure Labs Security Research Division -->
 # vamp-shodan-hunt
 
 **Shodan OSINT Hunter — VampSecure Labs Security Research Division**
@@ -10,6 +11,8 @@ Herramienta de inteligencia de fuentes abiertas (OSINT) que consulta la API de S
 
 ```bash
 pip install vamp-shodan-hunt
+# o con Homebrew:
+brew install vampsecure-labs/labs/vamp-shodan-hunt
 ```
 
 ## Uso
@@ -39,3 +42,8 @@ vamp-shodan-hunt --api-key TU_CLAVE --query 'port:22 country:ES'
 
 © VampSecure Studios — VampSecure Labs Security Research Division  
 Todos los derechos reservados. Uso exclusivo en entornos autorizados.
+
+---
+
+## Versión
+v1.1 — VampSecure Labs Security Research Division
