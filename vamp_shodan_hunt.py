@@ -29,19 +29,19 @@ AUTORÍA
   © VampSecure Studios — VampSecure Labs Security Research Division
   Todos los derechos reservados. Uso exclusivo en entornos autorizados.
 """
+from __future__ import annotations
 
-import asyncio
-import aiohttp
 import argparse
+import asyncio
 import json
 import os
 import sys
-import textwrap
 from collections import Counter
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+
+import aiohttp
 
 # Importar tomllib (Python 3.11+) o tomli como alternativa para Python 3.9/3.10
 try:
@@ -53,9 +53,8 @@ except ImportError:
         tomllib = None  # type: ignore[assignment]
 
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
-from rich.rule import Rule
+from rich.table import Table
 
 console = Console()
 
@@ -105,10 +104,10 @@ SEV_COLOR = {
 
 
 def cargar_config_api(
-    args_shodan_key: Optional[str] = None,
-    args_censys_id: Optional[str] = None,
-    args_censys_secret: Optional[str] = None,
-    args_binaryedge_key: Optional[str] = None,
+    args_shodan_key: str | None = None,
+    args_censys_id: str | None = None,
+    args_censys_secret: str | None = None,
+    args_binaryedge_key: str | None = None,
 ) -> dict:
     """
     Carga las claves de APIs de inteligencia con el siguiente orden de prioridad:
@@ -192,7 +191,7 @@ class ShodanMatch:
     product: str
     version: str
     banner:  str
-    vulns:   List[str] = field(default_factory=list)
+    vulns:   list[str] = field(default_factory=list)
     cpe:     str = ""      # CPE 2.3 del servicio (si Shodan lo proporciona)
 
 
@@ -203,12 +202,12 @@ class HuntResult:
     query:         str               # Query Shodan enviada
     label:         str               # CVE ID / nombre producto / org / raw
     total:         int               # Total hosts en Shodan (endpoint /count)
-    matches:       List[ShodanMatch] = field(default_factory=list)
-    top_countries: List[Tuple[str, int]] = field(default_factory=list)
-    top_orgs:      List[Tuple[str, int]] = field(default_factory=list)
-    top_products:  List[Tuple[str, int]] = field(default_factory=list)
-    top_versions:  List[Tuple[str, int]] = field(default_factory=list)
-    error:         Optional[str] = None
+    matches:       list[ShodanMatch] = field(default_factory=list)
+    top_countries: list[tuple[str, int]] = field(default_factory=list)
+    top_orgs:      list[tuple[str, int]] = field(default_factory=list)
+    top_products:  list[tuple[str, int]] = field(default_factory=list)
+    top_versions:  list[tuple[str, int]] = field(default_factory=list)
+    error:         str | None = None
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -225,7 +224,7 @@ class ShodanHunter:
         self._key   = api_key
         self._limit = limit
 
-    async def check_api(self, session: aiohttp.ClientSession) -> Dict:
+    async def check_api(self, session: aiohttp.ClientSession) -> dict:
         """Verifica la clave y obtiene información de la cuenta."""
         async with session.get(
             SHODAN_API_INFO,
@@ -257,7 +256,7 @@ class ShodanHunter:
         session: aiohttp.ClientSession,
         query: str,
         page: int,
-    ) -> List[Dict]:
+    ) -> list[dict]:
         """Trae una página de resultados de Shodan."""
         try:
             async with session.get(
@@ -278,9 +277,9 @@ class ShodanHunter:
         self,
         session: aiohttp.ClientSession,
         query: str,
-    ) -> List[ShodanMatch]:
+    ) -> list[ShodanMatch]:
         """Trae hasta self._limit hosts paginando la API de Shodan."""
-        matches: List[ShodanMatch] = []
+        matches: list[ShodanMatch] = []
         page = 1
 
         while len(matches) < self._limit:
@@ -312,7 +311,7 @@ class ShodanHunter:
 
         return matches
 
-    def _aggregate(self, matches: List[ShodanMatch]) -> Tuple:
+    def _aggregate(self, matches: list[ShodanMatch]) -> tuple:
         """Frecuencias de países, orgs, productos y versiones."""
         return (
             Counter(m.country for m in matches if m.country).most_common(8),
@@ -360,7 +359,7 @@ class ShodanHunter:
 
         return result
 
-    async def run(self, mode: str, targets: List[str]) -> List[HuntResult]:
+    async def run(self, mode: str, targets: list[str]) -> list[HuntResult]:
         """Ejecuta las consultas en paralelo para todos los targets."""
         async with aiohttp.ClientSession(
             headers={"User-Agent": f"VampSecureLabs-ShodanHunt/{VERSION}"}
@@ -458,7 +457,7 @@ class CensysHunter:
         headers    = {"Authorization": f"Basic {credencial}"}
 
         cursor  = None
-        matches: List[ShodanMatch] = []
+        matches: list[ShodanMatch] = []
 
         try:
             while len(matches) < self._limit:
@@ -516,7 +515,7 @@ class CensysHunter:
         result.top_versions  = top_v
         return result
 
-    async def run(self, mode: str, targets: List[str]) -> List[HuntResult]:
+    async def run(self, mode: str, targets: list[str]) -> list[HuntResult]:
         """Ejecuta las consultas Censys en paralelo para todos los targets."""
         async with aiohttp.ClientSession(
             headers={"User-Agent": f"VampSecureLabs-ShodanHunt/{VERSION}"}
@@ -612,7 +611,7 @@ class BinaryEdgeHunter:
 
         eventos = data.get("events", [])
         result.total   = len(eventos)
-        matches: List[ShodanMatch] = []
+        matches: list[ShodanMatch] = []
 
         for ev in eventos[: self._limit]:
             matches.append(self._map_match(target.strip(), ev))
@@ -626,7 +625,7 @@ class BinaryEdgeHunter:
         result.top_versions = top_v
         return result
 
-    async def run(self, mode: str, targets: List[str]) -> List[HuntResult]:
+    async def run(self, mode: str, targets: list[str]) -> list[HuntResult]:
         """Ejecuta las consultas BinaryEdge en paralelo para todos los targets."""
         async with aiohttp.ClientSession(
             headers={"User-Agent": f"VampSecureLabs-ShodanHunt/{VERSION}"}
@@ -639,7 +638,7 @@ class BinaryEdgeHunter:
 # Generación de hallazgos VSL
 # ────────────────────────────────────────────────────────────────────────────
 
-def _findings_vsl(results: List[HuntResult]) -> List:
+def _findings_vsl(results: list[HuntResult]) -> list:
     """Convierte los HuntResult al formato Finding de vampsec_report."""
     from vampsec_report import Finding as VSLFinding
 
@@ -682,9 +681,9 @@ def _findings_vsl(results: List[HuntResult]) -> List:
                 f"La muestra analizada cubre los primeros {len(r.matches)} hosts."
             )
             remediation = (
-                f"Revisar si todos los servicios expuestos son intencionales. "
-                f"Aplicar el principio de mínima exposición: solo exponer lo estrictamente necesario. "
-                f"Implementar monitorización continua de la superficie de ataque externa."
+                "Revisar si todos los servicios expuestos son intencionales. "
+                "Aplicar el principio de mínima exposición: solo exponer lo estrictamente necesario. "
+                "Implementar monitorización continua de la superficie de ataque externa."
             )
         else:
             title = f"Consulta Shodan: {r.label[:60]} — {r.total:,} resultados"
@@ -731,7 +730,7 @@ def _findings_vsl(results: List[HuntResult]) -> List:
 # Salida por consola
 # ────────────────────────────────────────────────────────────────────────────
 
-def print_summary_table(results: List[HuntResult]) -> None:
+def print_summary_table(results: list[HuntResult]) -> None:
     """Tabla resumen de todos los targets consultados."""
     t = Table(
         title="[bold cyan]Shodan Hunt — Resultados[/]",
@@ -839,7 +838,7 @@ def print_detail(result: HuntResult, fid: str) -> None:
 # Exportación JSON
 # ────────────────────────────────────────────────────────────────────────────
 
-def to_json(results: List[HuntResult], mode: str, generated_at: str) -> str:
+def to_json(results: list[HuntResult], mode: str, generated_at: str) -> str:
     """Serializa los resultados al formato JSON estándar VSL."""
     def _match_dict(m: ShodanMatch) -> dict:
         return {
@@ -893,7 +892,7 @@ def to_json(results: List[HuntResult], mode: str, generated_at: str) -> str:
 # Exportación en formato oracle (entrada para vamp-cve-oracle)
 # ────────────────────────────────────────────────────────────────────────────
 
-def to_oracle_json(results: List[HuntResult]) -> str:
+def to_oracle_json(results: list[HuntResult]) -> str:
     """
     Transforma los hallazgos de Shodan al formato de entrada de vamp-cve-oracle.
 
@@ -901,7 +900,7 @@ def to_oracle_json(results: List[HuntResult]) -> str:
     deduplicados por (host, port). Los campos vacíos se incluyen como cadena
     vacía para mantener el esquema uniforme que espera vamp-cve-oracle.
     """
-    oracle: List[Dict] = []
+    oracle: list[dict] = []
     seen: set = set()
 
     for result in results:
@@ -1144,7 +1143,7 @@ def main() -> None:
         return
 
     # Ejecución completa — consultar todas las fuentes con key disponible
-    results: List[HuntResult] = []
+    results: list[HuntResult] = []
 
     if usar_shodan:
         hunter_shodan = ShodanHunter(shodan_key, limit=args.limit)
@@ -1177,7 +1176,7 @@ def main() -> None:
         console.print(f"\n[green]✔ JSON guardado en {args.output}[/]")
 
     # ── Export oracle (formato de entrada para vamp-cve-oracle) ─────────────
-    export_oracle_path: Optional[str] = getattr(args, "export_oracle", None)
+    export_oracle_path: str | None = getattr(args, "export_oracle", None)
     if export_oracle_path:
         oracle_json = to_oracle_json(results)
         Path(export_oracle_path).write_text(oracle_json, encoding="utf-8")
@@ -1187,7 +1186,7 @@ def main() -> None:
         )
 
         # ── Pipeline automático a vamp-cve-oracle ────────────────────────────
-        pipe_cmd: Optional[str] = getattr(args, "pipe_oracle", None)
+        pipe_cmd: str | None = getattr(args, "pipe_oracle", None)
         if pipe_cmd:
             import subprocess
             cmd_full = f"{pipe_cmd} {export_oracle_path}"

@@ -1,10 +1,11 @@
 # © VampSecure Studios — VampSecure Labs Security Research Division
 """Tests unitarios para vamp-shodan-hunt."""
 
-import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
-import sys
 import os
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

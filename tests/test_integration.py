@@ -1,11 +1,11 @@
 # © VampSecure Studios — VampSecure Labs Security Research Division
 """Tests de integración para vamp-shodan-hunt."""
 
-import pytest
-import asyncio
-from unittest.mock import patch, MagicMock, AsyncMock
-import sys
 import os
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -37,7 +37,7 @@ async def test_shodan_hunter_run_completo(respuesta_shodan_search,
 
     # Mapear URLs a respuestas simuladas
     def get_side_effect(url, **kwargs):
-        params = kwargs.get("params", {})
+        kwargs.get("params", {})
         mock_resp = AsyncMock()
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_resp.__aexit__ = AsyncMock(return_value=False)
