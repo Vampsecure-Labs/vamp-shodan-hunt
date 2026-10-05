@@ -1,4 +1,6 @@
 <!-- © VampSecure Studios — VampSecure Labs Security Research Division -->
+
+  <img src="https://github.com/Vampsecure-Labs/vamp-shodan-hunt/actions/workflows/ci.yml/badge.svg" alt="CI"/>
 # vamp-shodan-hunt
 
 **Shodan OSINT Hunter — VampSecure Labs Security Research Division**
